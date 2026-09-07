@@ -85,6 +85,24 @@ def parse_args(args):
     parser.add_argument("--lr", default=0.0005, type=float)
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--mask_loss_weight", default=2.0, type=float)
+    parser.add_argument(
+        "--struct_loss_weight",
+        default=0.3,
+        type=float,
+        help="Initial weight of the structural (Gram) alignment loss. 0 disables it.",
+    )
+    parser.add_argument(
+        "--struct_decay_ratio",
+        default=0.33,
+        type=float,
+        help="Fraction of total training over which the structural weight cosine-decays to zero.",
+    )
+    parser.add_argument(
+        "--struct_group_k",
+        default=4,
+        type=int,
+        help="Consecutive points collapsed into one cell for the structural alignment.",
+    )
     parser.add_argument("--lora_alpha", default=32, type=int)
     parser.add_argument("--lora_dropout", default=0.05, type=float)
     parser.add_argument("--lora_target_modules", default="q_proj, v_proj", type=str)
@@ -155,6 +173,9 @@ def main(args):
         "vlm_out_dim": args.vlm_out_dim,
         "ce_loss_weight": args.ce_loss_weight,
         "mask_loss_weight": args.mask_loss_weight,
+        "struct_loss_weight": args.struct_loss_weight,
+        "struct_decay_steps": int(args.epochs * args.steps_per_epoch * args.struct_decay_ratio),
+        "struct_group_k": args.struct_group_k,
         "cont_token_idx": args.cont_token_idx,
         "torch_dtype": torch_dtype,
         "attention": args.attention,

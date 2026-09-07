@@ -5,6 +5,8 @@ Author: Lei Yao (rayyohhust@gmail.com)
 Please cite our work if the code is helpful to you.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -96,6 +98,7 @@ class PointBackbone(nn.Module):
         xyz_1, feat_1 = self.sa1(xyz_0, feat_0) # [B, 3, npoint_sa1] --- [B, 320, npoint_sa1]
         xyz_2, feat_2 = self.sa2(xyz_1, feat_1) # [B, 3, npoint_sa2] --- [B, 512, npoint_sa2]
         xyz_3, feat_3 = self.sa3(xyz_2, feat_2) # [B, 3, N_p] --- [B, 512, N_p]
+        feat_3_geom = feat_3 # [B, 512, N_p] pre-fusion geometry, kept for structural supervision
 
         h = self.proj(hidden_states)
 
@@ -118,7 +121,7 @@ class PointBackbone(nn.Module):
         feat_2 = feat_2.transpose(1, 2)
         feat_3 = feat_3.transpose(1, 2)
 
-        return [feat_3, feat_2, feat_1, feat_0]
+        return [feat_3, feat_2, feat_1, feat_0], feat_3_geom
     
 
 class LiftTo3D(nn.Module):
@@ -251,6 +254,10 @@ class Hammer(nn.Module):
         
         self.ce_loss_weight = kwargs.pop("ce_loss_weight", 0)
         self.mask_loss_weight = kwargs.pop("mask_loss_weight", 0)
+        self.struct_loss_weight = kwargs.pop("struct_loss_weight", 0.0)
+        self.struct_decay_steps = kwargs.pop("struct_decay_steps", 0)
+        self.struct_group_k = kwargs.pop("struct_group_k", 4)
+        self._struct_step = 0
 
     @torch.autocast(device_type='cuda', dtype=torch.float32)    
     def get_point_embs(self, points, hidden_states):
@@ -262,6 +269,47 @@ class Hammer(nn.Module):
         if "past_key_values" in kwargs:
             return super().forward(**kwargs)
         return self.model_forward(**kwargs)
+
+    @staticmethod
+    def gram_loss(feat_3_geom, gt_affords, k_group=4):
+        """
+        Align the second-order structure of pre-fusion geometric features with the
+        intent structure aggregated from ground-truth affordance labels.
+
+        Args:
+            feat_3_geom: pre-fusion geometric point features of shape (B, C, N)
+            gt_affords: ground-truth affordance probabilities of shape (B, M, 1)
+            k_group: groups of consecutive points collapsed into one cell
+        Returns:
+            mse loss between the predicted and target similarity matrices
+        """
+        B, C, N = feat_3_geom.shape
+        N_g = N // k_group
+        if N_g < 2:
+            return feat_3_geom.new_zeros(())
+
+        feat = feat_3_geom.reshape(B, C, N_g, k_group).mean(dim=-1)
+        feat = F.normalize(feat, dim=1)
+        pred_sim = torch.bmm(feat, feat.transpose(1, 2))
+
+        gt = gt_affords.reshape(B, -1).unsqueeze(1)
+        gt_g = F.interpolate(gt, size=(N_g,), mode="nearest")
+        positive = (gt_g > 0.5).float().squeeze(1)
+        target_sim = torch.bmm(positive.unsqueeze(1), positive.unsqueeze(2))
+        target_sim = target_sim / target_sim.mean().clamp_min(1e-8)
+
+        return F.mse_loss(pred_sim, target_sim)
+
+    def _struct_weight(self):
+        """Cosine decay of the structural loss weight down to zero."""
+        weight = self.struct_loss_weight
+        if weight <= 0:
+            return 0.0
+        decay_steps = self.struct_decay_steps
+        if decay_steps <= 0:
+            return weight
+        t = min(self._struct_step / decay_steps, 1.0)
+        return weight * 0.5 * (1.0 + math.cos(math.pi * t))
 
     def model_forward(
         self,
@@ -314,7 +362,7 @@ class Hammer(nn.Module):
             pred_embeddings_list.append(pred_embeddings[start_i:end_i])
         pred_embeddings = torch.stack(pred_embeddings_list, dim=0)
 
-        point_embeddings = self.get_point_embs(points, last_hidden_state)
+        point_embeddings, feat_3_geom = self.get_point_embs(points, last_hidden_state)
 
         cont = self.projection(pred_embeddings)
         cont = self.seg_model.lift_to_3d(cont, point_embeddings)
@@ -322,11 +370,22 @@ class Hammer(nn.Module):
         loss_ca = ca_loss(pred_afford, gt_affords)
         loss_ce = output.loss * self.ce_loss_weight
         loss_ca = loss_ca * self.mask_loss_weight
-        total_loss = loss_ce + loss_ca
+
+        struct_weight = self._struct_weight()
+        if struct_weight > 0 and not inference:
+            loss_struct = self.gram_loss(
+                feat_3_geom, gt_affords, self.struct_group_k
+            ) * struct_weight
+            self._struct_step += 1
+        else:
+            loss_struct = loss_ce.new_zeros(())
+        total_loss = loss_ce + loss_ca + loss_struct
         return {
             "loss": total_loss,
             "ce_loss": loss_ce,
             "ca_loss": loss_ca,
+            "struct_loss": loss_struct,
+            "struct_weight": struct_weight,
             "pred_afford": pred_afford
         }
 

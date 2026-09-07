@@ -20,10 +20,12 @@ def train(train_loader, model, epoch, scheduler, writer, train_iter, args, logge
     losses = AverageMeter("Loss", ":.4f")
     ce_losses = AverageMeter("CELoss", ":.4f")
     mask_losses = AverageMeter("MaskLoss", ":.4f")
+    struct_losses = AverageMeter("StructLoss", ":.4f")
+    struct_weights = AverageMeter("StructW", ":.4f")
 
     progress = ProgressMeter(
         args.steps_per_epoch,
-        [batch_time, losses, ce_losses, mask_losses],
+        [batch_time, losses, ce_losses, mask_losses, struct_losses, struct_weights],
         prefix="Epoch: [{}]".format(epoch),
         logger=logger,
     )
@@ -54,10 +56,14 @@ def train(train_loader, model, epoch, scheduler, writer, train_iter, args, logge
             loss = output_dict["loss"]
             ce_loss = output_dict["ce_loss"]
             mask_loss = output_dict["ca_loss"]
+            struct_loss = output_dict["struct_loss"]
+            struct_weight = output_dict["struct_weight"]
 
             losses.update(loss.item(), input_dict["points"].size(0))
             ce_losses.update(ce_loss.item(), input_dict["points"].size(0))
             mask_losses.update(mask_loss.item(), input_dict["points"].size(0))
+            struct_losses.update(struct_loss.item(), input_dict["points"].size(0))
+            struct_weights.update(struct_weight, input_dict["points"].size(0))
             model.backward(loss)
             model.step()
 
@@ -73,12 +79,16 @@ def train(train_loader, model, epoch, scheduler, writer, train_iter, args, logge
                 losses.all_reduce()
                 ce_losses.all_reduce()
                 mask_losses.all_reduce()
+                struct_losses.all_reduce()
+                struct_weights.all_reduce()
 
             if args.local_rank == 0:
                 progress.display(global_step + 1)
                 writer.add_scalar("train/loss", losses.avg, steps)
                 writer.add_scalar("train/ce_loss", ce_losses.avg, steps)
                 writer.add_scalar("train/mask_loss", mask_losses.avg, steps)
+                writer.add_scalar("train/struct_loss", struct_losses.avg, steps)
+                writer.add_scalar("train/struct_weight", struct_weights.avg, steps)
                 writer.add_scalar("metrics/total_secs_per_batch", batch_time.avg, steps)
                 writer.add_scalar("metrics/data_secs_per_batch", data_time.avg, steps)
 
@@ -86,6 +96,8 @@ def train(train_loader, model, epoch, scheduler, writer, train_iter, args, logge
                     "train/loss": losses.avg,
                     "train/ce_loss": ce_losses.avg,
                     "train/mask_loss": mask_losses.avg,
+                    "train/struct_loss": struct_losses.avg,
+                    "train/struct_weight": struct_weights.avg,
                     "metrics/total_secs_per_batch": batch_time.avg,
                     "metrics/data_secs_per_batch": data_time.avg,
                 }, step=steps)
@@ -95,6 +107,8 @@ def train(train_loader, model, epoch, scheduler, writer, train_iter, args, logge
             losses.reset()
             ce_losses.reset()
             mask_losses.reset()
+            struct_losses.reset()
+            struct_weights.reset()
 
         if global_step != 0:
             curr_lr = scheduler.get_last_lr()
